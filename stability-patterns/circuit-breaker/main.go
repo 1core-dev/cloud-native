@@ -1,3 +1,7 @@
+// Package circuitbreaker protects services from overload.
+//
+// It blocks calls after N failures, applies exponential backoff while open,
+// and resets on success.
 package circuitbreaker
 
 import (
@@ -7,54 +11,56 @@ import (
 	"time"
 )
 
-// ErrServiceUnavailable is an error indicating that the service is unavailable.
+// ErrServiceUnavailable signals that the circuit is currently open.
 var ErrServiceUnavailable = errors.New("service unavailable")
 
-// Circuit represents a function that can be executed with a context.
+// Circuit is a function that can be cancelled with context.
 type Circuit func(context.Context) (string, error)
 
-// Breaker creates a circuit breaker that tracks failures and controls
-// access to a service based on a failure threshold.
+// Breaker wraps a function with circuit breaker logic.
+// It tracks failures. After 'threshold' failures, it opens the circuit.
+// While open, it blocks calls for some time using exponential backoff.
+// If a call succeeds, it resets the failure counter.
 func Breaker(circuit Circuit, threshold int) Circuit {
 	var (
-		failures int
-		last     time.Time
-		mu       sync.RWMutex // Use RWMutex to allow concurrent reads
+		failures int       // how many times the function failed
+		last     time.Time // when the last attempt happened
+		mu       sync.RWMutex
 	)
 
 	// Return a new circuit breaker function
 	return func(ctx context.Context) (string, error) {
-		mu.RLock() // Lock for read access before checking the failure count
+		mu.RLock()
 
 		d := failures - threshold
 
-		// If the number of failures exceeds the threshold, calculate retry delay
+		// Too many failures: wait before retrying
 		if d >= 0 {
 			shouldRetryAt := last.Add((2 << d) * time.Second)
 
 			if !time.Now().After(shouldRetryAt) {
-				mu.RUnlock() // Unlock read lock before returning early
+				mu.RUnlock()
 				return "", ErrServiceUnavailable
 			}
 		}
 
-		mu.RUnlock() // Unlock read lock after check
+		mu.RUnlock()
 
 		// Execute the actual circuit function
 		response, err := circuit(ctx)
 
-		mu.Lock() // Lock for writing to shared resources (failures, last)
+		mu.Lock()
 		defer mu.Unlock()
 
-		last = time.Now() // Record time of the most recent attempt
+		last = time.Now()
 
 		if err != nil {
 			failures++
-			// Circuit returned an error so we count the failure and return
 			return response, err
 		}
 
-		failures = 0 // Reset failure count on success
+		// Success: reset the failure count
+		failures = 0
 
 		return response, nil
 	}
